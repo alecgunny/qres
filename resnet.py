@@ -1,3 +1,6 @@
+from functools import wraps
+
+from brevitas.quant_tensor import QuantTensor
 import torch
 from torch import nn
 import backend
@@ -22,7 +25,6 @@ def conv3x3(in_planes, out_planes, bit_width, stride=1, groups=1, dilation=1):
         padding=dilation,
         groups=groups,
         bias=False,
-        dilation=dilation
     )
 
 
@@ -35,8 +37,8 @@ def conv1x1(in_planes, out_planes, bit_width, stride=1):
         kernel_size=1,
         stride=stride,
         groups=1,
+        padding=0,
         bias=False,
-        dilation=1
     )
 
 
@@ -153,7 +155,7 @@ class Bottleneck(nn.Module):
 
         self.conv3 = conv1x1(width, planes * self.expansion, weight_bit_width)
         self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = backend.make_quant_relu(
+        self.relu3 = backend.make_quant_relu(
             bit_width=act_bit_width,
             per_channel_broadcastable_shape=(1, planes*self.expansion, 1, 1),
             scaling_per_channel=False,
@@ -180,8 +182,10 @@ class Bottleneck(nn.Module):
         if self.downsample is not None:
             identity = self.downsample(x)
 
+        if isinstance(identity, QuantTensor):
+            identity = identity.tensor
         out += identity
-        out = self.relu3(out)
+        out = self.relu3(identity)
 
         return out
 
@@ -206,6 +210,9 @@ class ResNet(nn.Module):
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
+        self.weight_bit_width = weight_bit_width
+        self.act_bit_width = act_bit_width
+
         self.inplanes = 64
         self.dilation = 1
         if replace_stride_with_dilation is None:
@@ -224,6 +231,7 @@ class ResNet(nn.Module):
             kernel_size=7,
             stride=2,
             padding=3,
+            groups=1,
             bias=False
         )
         self.bn1 = norm_layer(self.inplanes)
@@ -235,7 +243,7 @@ class ResNet(nn.Module):
         )
 
         # TODO: implement as quantized
-        nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
   
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
@@ -245,11 +253,10 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
 
-        # TODO: official implementation uses AdaptiveAvgPool2d
-        # have to hardcode size
-        self.avgpool = backend.make_quant_avg_pool(
-            act_bit_width, kernel_size=1, stride=1, signed=True)
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = backend.make_quant_linear(
+            512 * block.expansion, num_classes, True, weight_bit_width
+        )
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -277,18 +284,40 @@ class ResNet(nn.Module):
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
+                conv1x1(
+                    self.inplanes,
+                    planes * block.expansion,
+                    self.weight_bit_width,
+                    stride
+                ),
                 norm_layer(planes * block.expansion),
             )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
-                            self.base_width, previous_dilation, norm_layer))
+        layers.append(block(
+            self.inplanes,
+            planes,
+            self.weight_bit_width,
+            self.act_bit_width,
+            stride,
+            downsample,
+            self.groups,
+            self.base_width,
+            previous_dilation,
+            norm_layer
+        ))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, groups=self.groups,
-                                base_width=self.base_width, dilation=self.dilation,
-                                norm_layer=norm_layer))
+            layers.append(block(
+                self.inplanes,
+                planes,
+                self.weight_bit_width,
+                self.act_bit_width,
+                groups=self.groups,
+                base_width=self.base_width,
+                dilation=self.dilation,
+                norm_layer=norm_layer
+            ))
 
         return nn.Sequential(*layers)
 
@@ -304,6 +333,7 @@ class ResNet(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
 
+        x = x.tensor
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
@@ -314,49 +344,49 @@ class ResNet(nn.Module):
         return self._forward_impl(x)
 
 
-def _resnet(arch, block, layers, pretrained, progress, **kwargs):
+def _resnet(arch, block, layers, **kwargs):
     model = ResNet(block, layers, **kwargs)
-    if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch],
-                                              progress=progress)
-        model.load_state_dict(state_dict)
     return model
 
 
-def resnet18(pretrained=False, progress=True, **kwargs):
+class resnetwrapper:
+    def __init__(self, name, block, layers):
+        self.name = name
+        self.block = block
+        self.layers = layers
+
+    def __call__(self, f):
+        @wraps(f)
+        def wrapper(**kwargs):
+           return _resnet(self.name, self.block, self.layers, **kwargs)
+        return wrapper
+
+
+@resnetwrapper('resnet18', BasicBlock, [2, 2, 2, 2])
+def resnet18(**kwargs):
     r"""ResNet-18 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, progress,
-                   **kwargs)
+    pass
 
 
-def resnet34(pretrained=False, progress=True, **kwargs):
+@resnetwrapper('resnet34', BasicBlock, [3, 4, 6, 3])
+def resnet34(**kwargs):
     r"""ResNet-34 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], pretrained, progress,
-                   **kwargs)
+    pass
 
 
-def resnet50(pretrained=False, progress=True, **kwargs):
+@resnetwrapper('resnet50', Bottleneck, [3, 4, 6, 3])
+def resnet50(**kwargs):
     r"""ResNet-50 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress,
-                   **kwargs)
+    pass
 
 
-def resnet101(pretrained=False, progress=True, **kwargs):
+def resnet101(**kwargs):
     r"""ResNet-101 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
     Args:
